@@ -1,4 +1,5 @@
 use std;
+use std::collections::HashSet;
 use std::fmt;
 use std::fmt::Display;
 
@@ -15,8 +16,8 @@ pub struct Coff {
     f: FileHeader,
     opt: Option<OptionalHeader>,
     sect: Vec<SectionHeader>,
-    sym: SymbolTable,
-    strings: StringTable
+    pub sym: SymbolTable,
+    pub strings: StringTable
 }
 
 impl Display for Coff {
@@ -27,10 +28,10 @@ impl Display for Coff {
             writeln!(f, "Section: {}", hdr)?;
 
             if let &Some(ref relocs) = &hdr.relo_table {
-                writeln!(f, "\nRelocations:");
+                writeln!(f, "Relocations:");
                 for reloc in relocs.entries.iter() {
-                    writeln!(f, "  {:>10}: RELOC 0x{:x} ({}) {:?}",
-                        format!("0x{:x}", reloc.vaddr),
+                    writeln!(f, "  {:>#8x}: RELOC {:#x} ({}) {:?}",
+                        reloc.vaddr,
                         reloc.sym_idx,
                         self.sym.lookup(reloc.sym_idx).unwrap().n_name.to_string(&self.strings).unwrap_or("<Invalid name>".to_owned()).to_owned(),
                         reloc.reloc_type
@@ -45,14 +46,13 @@ impl Display for Coff {
         writeln!(f, "{:^68} | n_value    | scnum | type  | sclass|numaux", "Symbols:");
         for elem in &self.sym.entries {
             let name = elem.n_name.to_string(&self.strings).unwrap_or("<Invalid name>".to_owned());
-            writeln!(f, "Symbol: {:<60} | 0x{:>8x} | {:>5} | {:>5} | {:>5} | {:>5}",
+            writeln!(f, "Symbol: {:<60} | {:>#10x} | {:>5} | {:>5} | {:>5} | {:>5}",
                 name, elem.n_value, elem.n_scnum,
                 elem.n_type, elem.n_sclass, elem.n_numaux
             );
             if let &Some(ref entries) = &elem.n_auxentries {
                 for aux in entries {
-                    writeln!(f, "  Aux entry: {}",
-                        aux.iter().map(|b| format!("{:02x}", b)).collect::<String>());
+                    writeln!(f, "  Aux entry: {}", aux);
                 }
             }
         }
@@ -60,7 +60,33 @@ impl Display for Coff {
     }
 }
 
+impl ::ObjectFile for Coff {
+    fn provides_symbol(&self, name: &str) -> bool {
+        self.provided_symbols_by_name().contains(&name.to_string())
+    }
+    fn dependencies(&self) -> HashSet<String> {
+        self.needed_symbols_by_name().into_iter().collect::<HashSet<String>>()
+    }
+    fn provides(&self) -> HashSet<String> {
+        self.provided_symbols_by_name().into_iter().collect::<HashSet<String>>()
+    }
+}
+
 impl Coff {
+    pub fn needed_symbols_by_name(&self) -> Vec<String> {
+        self.sym.entries.iter()
+            .filter(|sym| sym.n_sclass == 2 && sym.n_scnum == 0)
+            .map(|sym| sym.n_name.to_string(&self.strings).unwrap())
+            .collect()
+    }
+
+    pub fn provided_symbols_by_name(&self) -> Vec<String> {
+        self.sym.entries.iter()
+            .filter(|sym| !(sym.n_sclass == 2 && sym.n_scnum == 0))
+            .map(|sym| sym.n_name.to_string(&self.strings).unwrap())
+            .collect()
+    }
+
     pub fn parse(bytes: Vec<u8>) -> Result<Coff, ParseErr> {
         let (file_header, next) = FileHeader::parse(&bytes, 0).unwrap();
         let (opthdr, offset_after_opt) = if file_header.f_opthdr != 0 {
@@ -95,8 +121,8 @@ pub enum ParseErr {
 }
 
 #[derive(Debug)]
-struct SymbolTable {
-    entries: Vec<SymbolEntry>
+pub struct SymbolTable {
+    pub entries: Vec<SymbolEntry>
 }
 
 impl SymbolTable {
@@ -128,14 +154,46 @@ impl SymbolTable {
 }
 
 #[derive(Debug)]
-struct SymbolEntry {
-    n_name: StringEntry,
-    n_value: u32,
-    n_scnum: u16,
-    n_type: u16,
-    n_sclass: u8,
-    n_numaux: u8,
-    n_auxentries: Option<Vec<Vec<u8>>>
+pub struct SymbolEntry {
+    pub n_name: StringEntry,
+    pub n_value: u32,
+    pub n_scnum: u16,
+    pub n_type: u16,
+    pub n_sclass: u8,
+    pub n_numaux: u8,
+    pub n_auxentries: Option<Vec<AuxEntry>>
+}
+
+#[derive(Debug)]
+pub enum AuxEntry {
+    // TagIndex, TotalSize, PointerToLinenumber, PointerToNextFunction
+    FunctionDef(u32, u32, u32, u32, u16),
+    // Length, NumReloc, NumLineno, Checksum (applicable for comdat), Number, Selection (COMDAT
+    // selection number
+    SectionDef(u32, u16, u16, u32, u16, u8, u8, u8, u8),
+    Unknown(Vec<u8>)
+}
+
+impl Display for AuxEntry {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            &AuxEntry::FunctionDef(tag, size, ptr_lno, ptr_nextfn, unused) => {
+                write!(f, "FnDef: tag:{:>#8x}, size:{:>#8x}, ptr_lno:{:>#8x}, ptr_nextfn:{:>#8x}", tag, size, ptr_lno, ptr_nextfn)
+            },
+            &AuxEntry::SectionDef(length, nreloc, nlineno, checksum, number, selection, _, _, _) => {
+                write!(f, "SectionDef: length:{:>#8x}, nreloc:{:>#8x}, nlineno:{:>#8x}", length, nreloc, nlineno);
+                // if this is symbol has comdat bits set, assume those were verified at parse-time
+                if selection == 5 {
+                    write!(f, ", comdat_section:{}, checksum:{:8x}", number, checksum)
+                } else {
+                    write!(f, ", selection:{}, comdat params not applicable ({}, {:8x})", selection, number, checksum)
+                }
+            },
+            &AuxEntry::Unknown(ref bytes) => {
+                write!(f, "Unknown: {}", bytes.iter().map(|b| format!("{:02x}", b)).collect::<String>())
+            }
+        }
+    }
 }
 
 impl Display for SymbolEntry {
@@ -157,13 +215,38 @@ impl SymbolEntry {
         match entry {
             Ok(mut symbol) => {
                 if symbol.n_numaux > 0 {
-                    let mut aux_entries: Vec<Vec<u8>> = Vec::new();
+                    let mut aux_entries: Vec<AuxEntry> = Vec::new();
 
                     for i in 0..symbol.n_numaux {
                         let next = if curr_ofs + SymbolEntry::size() > buf.len() {
                             Err(ParseErr::Unknown("Not enough data for aux entry".to_owned()))
                         } else {
-                            Ok(as_vec[curr_ofs..(curr_ofs + SymbolEntry::size())].to_vec())
+                            let bytes = as_vec[curr_ofs..(curr_ofs + SymbolEntry::size())].to_vec();
+                            let aux = if symbol.n_sclass == 2 && symbol.n_type == 0x20 && symbol.n_scnum > 0 {
+                                AuxEntry::FunctionDef(
+                                    bytes.read_u32(0).unwrap(),
+                                    bytes.read_u32(4).unwrap(),
+                                    bytes.read_u32(8).unwrap(),
+                                    bytes.read_u32(12).unwrap(),
+                                    bytes.read_u16(16).unwrap()
+                                )
+                                // read a FunctionDef
+                            } else if symbol.n_sclass == 3 && true /* is section */ {
+                                AuxEntry::SectionDef(
+                                    bytes.read_u32(0).unwrap(),
+                                    bytes.read_u16(4).unwrap(),
+                                    bytes.read_u16(6).unwrap(),
+                                    bytes.read_u32(8).unwrap(),
+                                    bytes.read_u16(12).unwrap(),
+                                    bytes.read_u8(14).unwrap(),
+                                    bytes.read_u8(15).unwrap(),
+                                    bytes.read_u8(16).unwrap(),
+                                    bytes.read_u8(17).unwrap()
+                                )
+                            } else {
+                                AuxEntry::Unknown(bytes)
+                            };
+                            Ok(aux)
                         };
                         match next {
                             Ok(sym) => {
@@ -200,18 +283,18 @@ impl SymbolEntry {
 }
 
 #[derive(Debug)]
-struct StringTable {
+pub struct StringTable {
     data: Vec<u8>
 }
 
 #[derive(Debug)]
-enum StringEntry {
+pub enum StringEntry {
     Literal([u8; 8]),
     Offset(u32)
 }
 
 impl StringEntry {
-    fn to_string(&self, strtab: &StringTable) -> Option<String> {
+    pub fn to_string(&self, strtab: &StringTable) -> Option<String> {
         match self {
             &StringEntry::Literal(ref slice) => {
                 let mut name = String::new();
@@ -324,7 +407,7 @@ impl RelocationType {
 }
 
 #[derive(Debug)]
-struct RelocationEntry {
+pub struct RelocationEntry {
     vaddr: u32,
     sym_idx: u32,
     reloc_type: RelocationType
@@ -350,21 +433,21 @@ impl RelocationEntry {
 }
 
 #[derive(Debug)]
-struct SectionRelocationTable {
+pub struct SectionRelocationTable {
     entries: Vec<RelocationEntry>
 }
 //    file_offset: u32,
 //    size: u16
 
 #[derive(Debug)]
-struct SectionLineNumberTable {
+pub struct SectionLineNumberTable {
     file_offset: u32,
     size: u16
 }
 
 /// The first pieces of a COFF image in any given file
 #[derive(Debug)]
-struct FileHeader {
+pub struct FileHeader {
     /// This is also known as `Machine` in MSDN docs.
     ///
     /// Typical values you may expect are:
@@ -406,7 +489,7 @@ impl FileHeader {
 /// This "Optional" header is pretty much always present in modern COFF images,
 /// but not object files.
 #[derive(Debug)]
-struct OptionalHeader {
+pub struct OptionalHeader {
     /// Known as `Magic`
     magic: u16,
     /// MSDN: `MajorLinkerVersion`
@@ -502,7 +585,7 @@ impl OptionalHeader {
 /// These fields come after the standard COFF Optional header, and are only present in PE images,
 /// not object files.
 #[derive(Debug)]
-struct WindowsSpecificOptionalHeader {
+pub struct WindowsSpecificOptionalHeader {
 }
 
 impl Display for SectionHeader {
@@ -517,10 +600,10 @@ impl Display for SectionHeader {
             }
         }
 
-        write!(f, "{:<8} | {:>10}, {:>10} | {:>10}, {:>10} | characteristics: {:?}",
+        write!(f, "{:>8} | {:>#8x}, {:>#8x} | {:>#8x}, {:>#8x} | {}",
             name,
-            format!("0x{:x}", self.s_scnptr), format!("0x{:x}", self.s_size),
-            format!("0x{:x}", self.s_vaddr), format!("0x{:x}", self.s_vsize),
+            self.s_scnptr, self.s_size,
+            self.s_vaddr, self.s_vsize,
             self.s_flags
         )?;
 
@@ -531,7 +614,7 @@ impl Display for SectionHeader {
 /// This header describes a section of the file, which may be code, data, or both.
 /// There are `f_nscns` many of these headers.
 #[derive(Debug)]
-struct SectionHeader {
+pub struct SectionHeader {
     /// MSDN: `Name`
     s_name: [u8; 8],
     /// MSDN: `VirtualSize`
@@ -629,7 +712,7 @@ impl SectionHeader {
 
 /// A struct for the flags of a section to provide nicer accessors for each bit
 #[derive(Debug)]
-struct Characteristics {
+pub struct Characteristics {
     value: u32
 }
 
@@ -638,6 +721,36 @@ impl Characteristics {
         Characteristics {
             value: value
         }
+    }
+}
+
+impl Display for Characteristics {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{:8x},", self.value);
+        write!(f, "ALIGN:{}", self.IMAGE_SCN_ALIGN());
+        let mut flags: Vec<&str> = vec![""];
+        if self.IMAGE_SCN_TYPE_NO_PAD() { flags.push("NO_PAD"); }
+        if self.IMAGE_SCN_CNT_CODE() { flags.push("CODE"); }
+        if self.IMAGE_SCN_CNT_INITIALIZED_DATA() { flags.push("INITIALIZED_DATA"); }
+        if self.IMAGE_SCN_CNT_UNINITIALIZED_DATA() { flags.push("UNINITIALIZED_DATA"); }
+        if self.IMAGE_SCN_LNK_OTHER() { flags.push("OTHER"); }
+        if self.IMAGE_SCN_LNK_INFO() { flags.push("INFO"); }
+        if self.IMAGE_SCN_LNK_REMOVE() { flags.push("REMOVE"); }
+        if self.IMAGE_SCN_LNK_COMDAT() { flags.push("COMDAT"); }
+        if self.IMAGE_SCN_GPREL() { flags.push("GPREL"); }
+        if self.IMAGE_SCN_MEM_PURGEABLE() { flags.push("PURGEABLE"); }
+        if self.IMAGE_SCN_MEM_16BIT() { flags.push("16BIT"); }
+        if self.IMAGE_SCN_MEM_LOCKED() { flags.push("LOCKED"); }
+        if self.IMAGE_SCN_MEM_PRELOAD() { flags.push("PRELOAD"); }
+        if self.IMAGE_SCN_LNK_NRELOC_OVFL() { flags.push("NRELOC_OVFL"); }
+        if self.IMAGE_SCN_MEM_DISCARDABLE() { flags.push("DISCARDABLE"); }
+        if self.IMAGE_SCN_MEM_NOT_CACHED() { flags.push("NOT_CACHED"); }
+        if self.IMAGE_SCN_MEM_NOT_PAGED() { flags.push("NOT_PAGED"); }
+        if self.IMAGE_SCN_MEM_SHARED() { flags.push("SHARED"); }
+        if self.IMAGE_SCN_MEM_EXECUTE() { flags.push("EXECUTE"); }
+        if self.IMAGE_SCN_MEM_READ() { flags.push("READ"); }
+        if self.IMAGE_SCN_MEM_WRITE() { flags.push("WRITE"); }
+        write!(f, "{}", flags.join(","))
     }
 }
 
@@ -674,7 +787,7 @@ impl Characteristics {
     fn IMAGE_SCN_ALIGN_EXP(&self) -> u8 { ((self.value >> 20) as u8) & 0x0f }
     /// This provides the numeric value of expected alignment, which is one of the powers of two
     /// between 1 and 8192 (inclusive)
-    fn IMAGE_SCN_ALIGN(&self) -> u16 { 1 << self.IMAGE_SCN_ALIGN_EXP() }
+    fn IMAGE_SCN_ALIGN(&self) -> u16 { 1 << (self.IMAGE_SCN_ALIGN_EXP() - 1) }
     /// Align data on a 1-byte boundary. Valid only for object files.
     fn IMAGE_SCN_ALIGN_1BYTES(&self) -> bool { (self.value & 0x00100000) != 0 }
     /// Align data on a 2-byte boundary. Valid only for object files.
