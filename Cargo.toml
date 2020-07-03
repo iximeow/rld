@@ -1,0 +1,26 @@
+[package]
+
+name = "rld"
+version = "0.0.1"
+authors = [ "iximeow <me@iximeow.net>" ]
+edition = "2018"
+license = "0BSD"
+repository = ""
+description = "linker"
+
+[[bin]]
+name = "rld"
+path = "src/main.rs"
+
+[dependencies]
+"termion" = "1.4.0"
+"tokio-core" = "*"
+"futures" = "*"
+"serde_json" = "*"
+"chan" = "*"
+serde = "*"
+serde_derive = "*"
+byteorder = "1"
+object = "0.20"
+yaxpeax-x86 = "0.0.13"
+yaxpeax-arch = "0.0.4"

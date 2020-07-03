@@ -60,7 +60,7 @@ impl Display for Coff {
     }
 }
 
-impl ::ObjectFile for Coff {
+impl crate::ObjectFile for Coff {
     fn provides_symbol(&self, name: &str) -> bool {
         self.provided_symbols_by_name().contains(&name.to_string())
     }

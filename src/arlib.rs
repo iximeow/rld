@@ -1,12 +1,12 @@
-use coff::*;
-use ::ObjectFile;
+// use crate::coff::*;
+// use crate::ObjectFile;
 
 use std::fs::File;
 use std::io::Read;
 
 use std::str;
 
-use ar::Archive;
+use crate::ar::Archive;
 
 /*
  *  For a .lib (or .lib-like files)
@@ -23,7 +23,8 @@ impl ArLib {
             archive: archive
         }
     }
-    pub fn objects(&mut self) -> Vec<Box<ObjectFile>> {
+    /*
+    pub fn objects(&mut self) -> Vec<Box<object::read::coff::CoffFile>> {
         let mut result = vec![];
         while let Some(entry_result) = self.archive.next_entry() {
             let mut entry = entry_result.unwrap();
@@ -32,9 +33,10 @@ impl ArLib {
             let name = str::from_utf8(entry.header().identifier().clone()).unwrap();
             println!("Looking at {}", name);
             if name.ends_with(".o") || name.ends_with(".obj") {
-                result.push(Box::new(Coff::parse(body).unwrap()) as Box<ObjectFile>);
+                result.push(Box::new(object::read::coff::CoffFile::parse(body).unwrap()));
             }
         }
         return result;
     }
+    */
 }
