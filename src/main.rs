@@ -23,6 +23,7 @@ use object::RelocationKind;
 use object::SectionIndex;
 use object::SymbolFlags;
 use object::SymbolIndex;
+use object::SymbolScope;
 use object::SectionKind;
 use object::{read, write};
 use object::read::Object;
@@ -192,9 +193,28 @@ fn main() {
                             kind: SectionKind::ReadOnlyData as u8
                         }
                     }
-                    SectionKind::Metadata => {
+                    SectionKind::ReadOnlyString => {
                         SegmentDesc {
-                            name: name.as_bytes().to_vec(),
+                            name: b".rodata".to_vec(),
+                            kind: SectionKind::ReadOnlyString as u8
+                        }
+                    }
+                    SectionKind::UninitializedData => {
+                        SegmentDesc {
+                            name: b".bss".to_vec(),
+                            kind: SectionKind::UninitializedData as u8
+                        }
+                    }
+                    SectionKind::UninitializedTls => {
+                        SegmentDesc {
+                            name: b".tbss".to_vec(),
+                            kind: SectionKind::UninitializedTls as u8
+                        }
+                    }
+                    SectionKind::Metadata => {
+                        // route metadata sections to .rodata, if they hold data at all
+                        SegmentDesc {
+                            name: b".rodata".to_vec(), // name.as_bytes().to_vec(),
                             kind: SectionKind::Metadata as u8
                         }
                     }
@@ -218,7 +238,6 @@ fn main() {
 
     for (idx, elem) in inputs.iter().enumerate() {
         let mut f = File::open(&elem).unwrap();
-        writeln!(log, "linking {}", elem);
         let mut buf: Vec<u8> = Vec::new();
         f.read_to_end(&mut buf);
         // let obj = object::read::coff::CoffFile::parse(&buf).unwrap();
@@ -295,15 +314,17 @@ fn main() {
     // been added. we don't know which weak symbols are necessary until we've found a reference to
     // them that also has not been satisfied by a strong symbol, so instead track where we've seen
     // weak symbols in imputs we've processed.
-    let mut weak_symbols: HashMap<String, usize> = HashMap::new();
+    let mut weak_symbols: HashMap<String, String> = HashMap::new();
 
-    let mut intra_object_unresolved: Vec<String> = Vec::new();
+    let mut intra_object_unresolved: HashSet<String> = HashSet::new();
     let mut input_provided_symbols: HashSet<String> = HashSet::new();
 
+    /*
     let mut writers: HashMap<u8, Cursor<&mut Vec<u8>>> = HashMap::new();
     for (k, v) in &mut sections {
         writers.insert(*k, Cursor::new(v));
     }
+    */
     eprintln!("building .data...");
     // ok, try to build .data
     for (idx, elem) in inputs.iter().enumerate() {
@@ -311,6 +332,22 @@ fn main() {
         let mut buf: Vec<u8> = Vec::new();
         f.read_to_end(&mut buf);
 
+        link_object_bytes(elem, &mut log, &mut result, &mut section_ids, &mut sections, &mut intra_object_unresolved, &mut input_provided_symbols, &mut weak_symbols, &buf).expect("can link object into artifact");
+    }
+
+    fn link_object_bytes(
+        path: &str,
+        log: &mut File,
+        result: &mut write::Object,
+        section_ids: &mut HashMap<u8, write::SectionId>,
+        sections: &mut HashMap<u8, Vec<u8>>,
+//        writers: &mut HashMap<u8, Cursor<&mut Vec<u8>>>,
+        intra_object_unresolved: &mut HashSet<String>,
+        input_provided_symbols: &mut HashSet<String>,
+        weak_symbols: &mut HashMap<String, String>,
+        buf: &[u8]
+    ) -> Result<(), String> {
+        writeln!(log, "linking {}", path);
         let obj = object::read::File::parse(&buf).unwrap();
         let mut symbols_by_section: HashMap<Option<SectionIndex>, Vec<(SymbolIndex, read::Symbol)>> = HashMap::new();
         for (sym_idx, sym) in obj.symbols() {
@@ -343,23 +380,56 @@ fn main() {
 
         // offsets of 
         let mut inner_section_offsets: HashMap<SectionIndex, u64> = HashMap::new();
-        let data_section_id = *section_ids.get(&(SectionKind::Data as u8)).expect("data section is defined");
-        let rodata_section_id = *section_ids.get(&(SectionKind::ReadOnlyData as u8)).expect("rodata section is defined");
 
         for sec in obj.sections() {
-            if SectionKind::Text == sec.kind() || SectionKind::Data == sec.kind() || SectionKind::ReadOnlyData == sec.kind() {
-                let data_section_kind = sec.kind() as u8;
-                let data_section_id = *section_ids.get(&data_section_kind).expect("section kind has been seen and a matching output segment has been declared");
-                let mut data_writer = writers.get_mut(&data_section_kind).unwrap_or_else(|| {
+            writeln!(log, "sec: {:?}", sec);
+            if SectionKind::Text == sec.kind() || SectionKind::Data == sec.kind() || SectionKind::ReadOnlyData == sec.kind() || SectionKind::ReadOnlyString == sec.kind() || SectionKind::UninitializedData == sec.kind() || SectionKind::UninitializedTls == sec.kind() || SectionKind::Metadata == sec.kind(){
+                let section_name = sec.name().expect("section has name");
+                let desc = if sec.kind() != SectionKind::Unknown {
+                    SectionDesc::ByKind(sec.kind() as u8, section_name.to_string())
+                } else {
+                    SectionDesc::ByName(section_name.to_string())
+                };
+                let desc = segment_for_desc(&result, &desc);
+                let data_section_kind = desc.kind;
+                let data_section_id = match section_ids.get(&data_section_kind) {
+                    Some(id) => *id,
+                    None => {
+                        writeln!(log, "ugh gotta add a new section for {}", section_name);
+                        // this section wasn't present in input files, but is needed now by some
+                        // subsequently included object.
+                        let section_id = result.add_section(
+                            Vec::new(), // we'll build data for sections elsewhere and set it later
+                            desc.name.clone(),
+                            unsafe { std::mem::transmute::<u8, SectionKind>(desc.kind) }
+                        );
+                        section_ids.insert(desc.kind, section_id);
+                        // don't know the size this section will have to be, so start it at 0...
+                        sections.insert(desc.kind, Vec::new());
+                        section_id
+                    }
+                };
+                let data = sections.get_mut(&data_section_kind).unwrap_or_else(|| {
                     panic!("writer for section {:?} exists", sec.kind())
                 });
+                let data_offset = data.len();
+                let mut data_writer = Cursor::new(data);
+                data_writer.set_position(data_offset as u64);
                 let position = data_writer.position();
                 writeln!(log, "found data section: {:?}. copying {} bytes to section for {:?} at {}", sec.name(), sec.data().unwrap().len(), sec.kind(), position);
                 data_writer.write(sec.data().unwrap());
                 local_moved_sections.insert(sec.index(), (*section_ids.get(&data_section_kind).unwrap(), sec.address() + position));
                 if let Some(symbols) = symbols_by_section.get(&Some(sec.index())) {
                     for (sym_idx, sym) in symbols {
+                        if sec.name() == Ok(".strtab") {
+                            writeln!(log, "STRTAB SYM: {:?}", sym.name());
+                        }
                         local_moved_symbols.insert(*sym_idx, (data_section_id, sym.address() + position));
+                        if sym.scope() == SymbolScope::Compilation {
+                            // this symbol isn't visible outside the compilation unit (object), so
+                            // now that we've tracked it being relocated we can just continue
+                            continue;
+                        }
                         // make a new symbol for the output
                         let new_sym = write::Symbol {
                             name: sym.name().map(|x| x.as_bytes().to_vec()).unwrap_or_else(|| Vec::new()),
@@ -380,12 +450,16 @@ fn main() {
                             }
                         };
                         if sym.is_weak() {
-                            weak_symbols.insert(sym.name().expect("weak symbols have names").to_string(), idx);
+                            weak_symbols.insert(sym.name().expect("weak symbols have names").to_string(), path.to_string());
                         } else {
                             // add a symbol for the data we just copied..
                             result.add_symbol(new_sym);
                             if sym.is_global() {
-                                writeln!(log, "adding global symbol {} from {}", sym.name().expect("has name"), elem);
+                                // this object provides the symbol. if it was unresolved across
+                                // objects, it is now resolved.
+                                intra_object_unresolved.remove(sym.name().expect("symbol has a name"));
+                                writeln!(log, "adding global symbol {} from {}", sym.name().expect("has name"), path);
+                                writeln!(log, "  -> {:?}", sym);
                                 if !input_provided_symbols.insert(sym.name().expect("symbol has a name").to_string()) {
                                     writeln!(log, "duplicate symbol {:?}", sym);
                                     panic!("duplicate symbol {}", sym.name().expect("symbol has a name"));
@@ -437,11 +511,16 @@ fn main() {
                         }
                     }
                 }
+            } else {
+                writeln!(log, "HEY. ignoring section {:?}", sec);
             }
         }
 
         for (result_section_id, source_section_refs) in &local_section_refs {
             for (source_section, reloc) in source_section_refs {
+                if local_moved_sections.get(&source_section).is_none() {
+                    writeln!(log, "section {:?} was not moved???!!!", obj.section_by_index(*source_section));
+                }
                 let (moved_section_dest_id, moved_section_dest_offset) =
                     local_moved_sections.get(&source_section).expect("moved section has a source");
 
@@ -477,21 +556,26 @@ fn main() {
                 None => {
                     let sym = obj.symbol_by_index(sym).expect("valid index");
                     let name = sym.name().expect("intra-object symbol references should have a name");
-                    if name == "_Unwind_Resume" {
-                        writeln!(log, "FOUND _UNWIND_RESUME: {:?}", sym);
+                    // the symbol reference may not be a local symbol, but could already have been
+                    // resolved by some other symbol provided by another input.
+                    if !input_provided_symbols.contains(name) {
+                        writeln!(log, "unsatisfied symbol: {:?}", sym);
+                        if name.contains(".L.str.") {
+                            panic!("somehow a str symbol is unsatisfied? it is reportedly not moved");
+                        }
+                        intra_object_unresolved.insert(name.to_string());
                     }
-                    writeln!(log, "unsatisfied symbol: {:?}", name);
-                    intra_object_unresolved.push(name.to_string());
                 }
             }
         }
 
         writeln!(log, "linked object unresolved section refs: {:?}", local_section_refs);
+        Ok(())
     }
 
     eprintln!("unresolved symbols must be found in the following libraries: {:?}", rlibs);
 
-    fn resolve_symbol(log: &mut File, rlibs: &[String], name: &str) -> Result<Vec<u8>, String> {
+    fn resolve_symbol(log: &mut File, rlibs: &[String], name: &str) -> Result<(Vec<u8>, String), String> {
         for path in rlibs {
             writeln!(log, "looking at rlib {}", path);
             let mut f = File::open(&path).unwrap();
@@ -516,7 +600,7 @@ fn main() {
                             }
                             if sym.1.name() == Some(name) {
                                 writeln!(log, "found object containing {}", name);
-                                return Ok(objbuf);
+                                return Ok((objbuf, std::str::from_utf8(entry.header().identifier()).expect("is valid utf8").to_string()));
                             }
                         }
                     }
@@ -532,16 +616,28 @@ fn main() {
 
     let mut unresolved_dynamic: HashSet<String> = HashSet::new();
 
-    for name in &intra_object_unresolved {
-        if input_provided_symbols.contains(name) {
-            writeln!(log, "symbol {} is provided by an input object", name);
+    while let Some(name) = {
+        let next = intra_object_unresolved.iter().next().map(|x| x.to_string());
+        next.map(|item| {
+            intra_object_unresolved.remove(&item);
+            item
+        })
+    } {
+        if input_provided_symbols.contains(&name) {
+            writeln!(log, "symbol {} is provided by an input object, but is reportedly intra-object unresolved", name);
+            panic!("symbol {} is provided by an input object, but is reportedly intra-object unresolved", name);
             continue;
         }
-        let result = resolve_symbol(&mut log, &rlibs, name);
-        writeln!(log, "resolved to? {}", result.is_ok());
-        if result.is_err() {
-            writeln!(log, "unresolved symbol {}", name);
-            unresolved_dynamic.insert(name.to_string());
+//        writeln!(log, "resolved to? {}", result.is_ok());
+        match resolve_symbol(&mut log, &rlibs, &name) {
+            Ok((bytes, path)) => {
+                writeln!(log, "linking {} to resolve symbol {}", path, name);
+                link_object_bytes(&path, &mut log, &mut result, &mut section_ids, &mut sections, &mut intra_object_unresolved, &mut input_provided_symbols, &mut weak_symbols, &bytes).expect("can link object into artifact");
+            }
+            Err(_) => {
+                writeln!(log, "unresolved symbol {}", &name);
+                unresolved_dynamic.insert(name);
+            }
         }
     }
 
