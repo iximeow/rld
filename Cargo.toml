@@ -21,6 +21,6 @@ path = "src/main.rs"
 serde = "*"
 serde_derive = "*"
 byteorder = "1"
-object = "0.20"
+object = { version = "0.20", features = ["read", "write"] }
 yaxpeax-x86 = "0.0.13"
 yaxpeax-arch = "0.0.4"

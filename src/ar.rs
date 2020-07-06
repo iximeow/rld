@@ -328,7 +328,7 @@ impl Header {
 
 fn parse_number(field_name: &str, bytes: &[u8], radix: u32) -> Result<u64> {
     if let Ok(string) = str::from_utf8(bytes) {
-        if let Ok(value) = u64::from_str_radix(string.trim_right(), radix) {
+        if let Ok(value) = u64::from_str_radix(string.trim_end(), radix) {
             return Ok(value);
         } else {
             let mut empty = true;

@@ -2,9 +2,9 @@
 // use crate::ObjectFile;
 
 use std::fs::File;
-use std::io::Read;
+// use std::io::Read;
 
-use std::str;
+// use std::str;
 
 use crate::ar::Archive;
 
